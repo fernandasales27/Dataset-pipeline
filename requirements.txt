@@ -1,0 +1,16 @@
+astroid==4.0.4
+certifi==2026.7.22
+charset-normalizer==3.5.2
+dill==0.4.1
+idna==3.20
+isort==9.0.2
+mccabe==0.7.0
+mypy_extensions==1.1.0
+orjson==3.13.0
+platformdirs==4.12.4
+pylint==4.0.10
+requests==2.34.2
+tomli==2.5.0
+tomlkit==0.15.1
+typing_extensions==4.16.0
+urllib3==2.8.0

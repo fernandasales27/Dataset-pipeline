@@ -1,0 +1,11 @@
+*.jsonl
+Babel/
+repos_cache/
+eslint_deps/
+node_modules/
+__pycache__/
+*.bak*
+*.log
+*.out
+*.err
+backup_*/
