@@ -1,0 +1,7 @@
+.git
+__pycache__
+*.jsonl
+Babel
+repos_cache
+eslint_deps
+node_modules
