@@ -61,6 +61,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -1298,10 +1299,408 @@ class ESLintAdapter:
         return out
 
 
+class PMDAdapter:
+    """PMD (Java) -- analisa o CODIGO-FONTE, sem compilar. Segue o mesmo
+    desenho do CheckstyleAdapter: so Maven, veredito por commit lendo so
+    objetos do git, varias versoes tentadas da mais nova pra mais antiga.
+
+    Adocao = `maven-pmd-plugin` no pom.xml da RAIZ. O pom diz qual ruleset
+    o time usa (<rulesets><ruleset>...); por commit:
+      - arquivo do proprio repositorio, ou ruleset embutido no PMD citado
+        no pom (category/java/..., rulesets/java/...)  -> "own"
+      - plugin sem <rulesets> (usa o ruleset interno do plugin, que o PMD
+        solto NAO traz) ou pom sem o plugin (commit anterior a adocao)
+        -> "default" (DEFAULT_RULESET), marcado has_own_config=False
+    Excluem o commit: ruleset com ${...}, URL remota, caminho que nao
+    existe no repositorio (ex.: vem de dependencia do plugin) e pom que
+    usa excludeFromFailureFile (arquivo de supressao -- mesma regra "S+"
+    do Checkstyle). As demais opcoes do plugin so viram flag.
+
+    Limitacao conhecida (ameaca a validade): o plugin passa o classpath
+    compilado ao PMD (typeResolution=true); aqui nao compilamos, entao as
+    regras que dependem de tipos podem diferir do que o time via.
+    """
+    name = "pmd"
+    language = "Java"
+
+    # Mesma convencao do Checkstyle/Styler: ignora arquivo em pasta com
+    # esses nomes (o plugin tambem nao analisa testes por padrao).
+    EXCLUDE_DIRS = {"test", "resources"}
+
+    # Existe no PMD 6.x e 7.x (nao no 5.x -- o default so roda com a versao
+    # mais nova, que e sempre a primeira da lista).
+    DEFAULT_RULESET = "rulesets/java/quickstart.xml"
+    TIMEOUT_SECONDS = 900
+    PLUGIN_ARTIFACT_ID = "maven-pmd-plugin"
+
+    # Opcoes do <configuration> que apontam arquivo de supressao -- o
+    # commit sai. Nomes conferidos na doc do maven-pmd-plugin 3.28:
+    # excludeFromFailureFile (propriedade pmd.excludeFromFailureFile).
+    POM_BLOCKING_OPTIONS = {"excludeFromFailureFile"}
+    POM_BLOCKING_PROPERTIES = {"pmd.excludeFromFailureFile"}
+
+    UNRESOLVED_VARIABLE_RE = re.compile(r"\$\{[\w.\-]+\}")
+    XML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+    REMOTE_REF_RE = re.compile(r"""ref\s*=\s*["']https?://""", re.IGNORECASE)
+    BUILTIN_RE = re.compile(r"^(?:rulesets/|category/|java-[\w\-]+$)")
+    # 0 = sem violacao, 4 = violacoes, 5 = erros recuperaveis de processamento
+    # (PMD 7). 1/2/3 = excecao, uso errado, config -- falha de execucao.
+    OK_EXIT_CODES = (0, 4, 5)
+
+    @classmethod
+    def add_cli_args(cls, parser):
+        parser.add_argument(
+            "--pmd-home", required=True, action="append",
+            help="Pasta de uma distribuicao do PMD (pmd-bin-X.Y.Z, a que tem bin/ e lib/). Pode ser "
+                 "passado varias vezes -- a config propria e tentada em cada versao, da mais nova "
+                 "pra mais antiga, ate uma carregar (mesma estrategia do Checkstyle).",
+        )
+
+    def __init__(self, args):
+        homes = []
+        for home_arg in args.pmd_home:
+            # absoluto: o PMD roda com cwd=repo_dir, caminho relativo quebraria
+            home = Path(home_arg).resolve()
+            match = re.search(r"pmd-bin-(\d+(?:\.\d+)*)", home.name)
+            version = match.group(1) if match else "unknown"
+            major = int(version.split(".")[0]) if match else 0
+            # PMD 7: bin/pmd check ... ; PMD 5/6: bin/run.sh pmd ...
+            if major >= 7:
+                launcher = [str(home / "bin" / "pmd"), "check"]
+            else:
+                launcher = [str(home / "bin" / "run.sh"), "pmd"]
+            if not Path(launcher[0]).exists():
+                raise FileNotFoundError(
+                    f"PMD nao encontrado em {home.resolve()} (esperava {launcher[0]}) -- baixe em "
+                    "https://github.com/pmd/pmd/releases e descompacte"
+                )
+            homes.append({"home": home, "version": version, "label": f"pmd {version}",
+                          "major": major, "launcher": launcher})
+
+        def version_key(item):
+            parts = [int(p) for p in item["version"].split(".")] if item["version"] != "unknown" else [-1]
+            return tuple(parts + [0] * (3 - len(parts)))
+
+        homes.sort(key=version_key, reverse=True)
+        self.versions: list[dict] = homes
+        self._pom_cache: dict[str, dict] = {}       # por id de blob
+        self._ruleset_cache: dict[str, list] = {}   # por id de blob: motivos de exclusao
+        self._plan: Optional[dict] = None
+        self.last_run_info: dict = {}
+
+    def get_version(self) -> str:
+        if len(self.versions) == 1:
+            return self.versions[0]["label"]
+        todas = ", ".join(v["label"] for v in self.versions)
+        return f"{self.versions[0]['label']} (com fallback pra: {todas})"
+
+    def has_own_config(self, repo_dir: Path) -> bool:
+        return bool(self._plan and self._plan.get("ruleset") == "own")
+
+    # ------------------------------------------------------------------
+    # Regras de elegibilidade por commit (todas SEM checkout)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    def _analyze_pom_text(self, pom_text: str) -> dict:
+        """O que o pom.xml diz sobre o maven-pmd-plugin: se esta presente,
+        quais <ruleset> declara, opcoes bloqueantes (supressao) e flags
+        (qualquer outra opcao). Nao resolve pom pai, perfis nem properties."""
+        info = {"has_plugin": False, "rulesets": [], "blocking": [], "flags": [], "parse_error": False}
+        try:
+            root = ET.fromstring(pom_text)
+        except ET.ParseError:
+            info["parse_error"] = True
+            return info
+
+        blocking: set[str] = set()
+        flags: set[str] = set()
+        rulesets: list[str] = []
+        for plugin in root.iter():
+            if self._local_name(plugin.tag) != "plugin":
+                continue
+            artifact_id = next((c for c in plugin if self._local_name(c.tag) == "artifactId"), None)
+            if artifact_id is None or (artifact_id.text or "").strip() != self.PLUGIN_ARTIFACT_ID:
+                continue
+            info["has_plugin"] = True
+            for conf in plugin.iter():
+                if self._local_name(conf.tag) != "configuration":
+                    continue
+                for option in conf:
+                    opt = self._local_name(option.tag)
+                    if opt == "rulesets":
+                        for item in option:
+                            text = (item.text or "").strip()
+                            if text and text not in rulesets:
+                                rulesets.append(text)
+                    elif opt in self.POM_BLOCKING_OPTIONS:
+                        blocking.add(opt)
+                    else:
+                        flags.add(opt)
+        for props in root.iter():
+            if self._local_name(props.tag) != "properties":
+                continue
+            for prop in props:
+                if self._local_name(prop.tag) in self.POM_BLOCKING_PROPERTIES:
+                    blocking.add(self._local_name(prop.tag))
+
+        info["rulesets"] = rulesets
+        info["blocking"] = sorted(blocking)
+        info["flags"] = sorted(flags)
+        return info
+
+    def _tree_blobs(self, repo_dir: Path, commit_hash: str, paths: list[str]) -> dict[str, str]:
+        return _git_tree_blobs(repo_dir, commit_hash, paths)
+
+    def _blob_text(self, repo_dir: Path, blob_sha: str) -> str:
+        return run_cmd(["git", "cat-file", "blob", blob_sha], cwd=repo_dir).stdout
+
+    def _ruleset_file_problems(self, text: str) -> list[str]:
+        """Motivos de exclusao dentro de um arquivo de ruleset: ${...} fora
+        de comentario XML, ou ref apontando pra URL remota."""
+        problems = []
+        clean = self.XML_COMMENT_RE.sub("", text)
+        if self.UNRESOLVED_VARIABLE_RE.search(clean):
+            problems.append("config_variavel")
+        if self.REMOTE_REF_RE.search(clean):
+            problems.append("ruleset_remoto")
+        return problems
+
+    def precheck(self, repo_dir: Path, commit_hash: str, branch: str) -> dict:
+        """Veredito do commit, ANTES do checkout (so arvores + os blobs do
+        pom.xml e dos rulesets do repositorio, cacheados por id de blob).
+
+        Codigos de exclusao (CommitDiscarded.reasons):
+          nao_maven                 sem pom.xml na raiz DESTE commit
+          pom_config_ou_suppression pom usa excludeFromFailureFile
+          config_variavel           ruleset com ${...} (no pom ou no arquivo)
+          ruleset_remoto            ruleset por URL http(s)
+          ruleset_nao_encontrado    ruleset do pom nao e arquivo do repositorio
+                                    nem ruleset embutido do PMD
+        """
+        self._plan = None
+        pom_blob = self._tree_blobs(repo_dir, commit_hash, ["pom.xml"])
+        if "pom.xml" not in pom_blob:
+            raise CommitDiscarded("nao_maven", "sem pom.xml na raiz do commit")
+
+        pom_sha = pom_blob["pom.xml"]
+        if pom_sha not in self._pom_cache:
+            self._pom_cache[pom_sha] = self._analyze_pom_text(self._blob_text(repo_dir, pom_sha))
+        pom = self._pom_cache[pom_sha]
+
+        reasons: list[str] = []
+        details: list[str] = []
+        if pom["blocking"]:
+            reasons.append("pom_config_ou_suppression")
+            details.append("pom: " + ", ".join(pom["blocking"]))
+
+        # Resolve cada <ruleset> do pom.
+        refs: list[str] = []          # o que vai no -R
+        file_refs: list[str] = []     # os que sao arquivos do repositorio
+        for raw in pom["rulesets"]:
+            ref = raw.strip()
+            if "${" in ref:
+                reasons.append("config_variavel"); details.append(f"ruleset {ref}")
+            elif re.match(r"https?://", ref, re.IGNORECASE):
+                reasons.append("ruleset_remoto"); details.append(f"ruleset {ref}")
+            elif self.BUILTIN_RE.match(ref.lstrip("/")):
+                refs.append(ref.lstrip("/"))
+            else:
+                norm = os.path.normpath(ref).replace("\\", "/")
+                if norm.startswith("../") or norm.startswith("/"):
+                    reasons.append("ruleset_nao_encontrado"); details.append(f"ruleset {ref}")
+                else:
+                    file_refs.append(norm)
+                    refs.append(norm)
+
+        if file_refs:
+            found = self._tree_blobs(repo_dir, commit_hash, file_refs)
+            for path in file_refs:
+                if path not in found:
+                    reasons.append("ruleset_nao_encontrado"); details.append(f"{path} nao existe no commit")
+                    continue
+                sha = found[path]
+                if sha not in self._ruleset_cache:
+                    self._ruleset_cache[sha] = self._ruleset_file_problems(self._blob_text(repo_dir, sha))
+                for problem in self._ruleset_cache[sha]:
+                    reasons.append(problem); details.append(f"{path}: {problem}")
+
+        if reasons:
+            # sem repetir codigo, mantendo a ordem
+            raise CommitDiscarded(list(dict.fromkeys(reasons)), "; ".join(details))
+
+        if pom["has_plugin"] and refs:
+            ruleset, motivo = "own", None
+        elif pom["has_plugin"]:
+            ruleset, motivo = "default", "plugin_sem_rulesets"
+        else:
+            ruleset, motivo = "default", "pom_sem_plugin"
+
+        plan = {
+            "ruleset": ruleset,
+            "ruleset_motivo": motivo,
+            "config_path": ",".join(refs) if ruleset == "own" else None,
+            "pom_flags": pom["flags"],
+            "pom_parse_error": pom["parse_error"],
+            "n_configs": len(refs),
+            "extra": {"pom_pmd_options": pom["flags"]},
+        }
+        self._plan = plan
+        return plan
+
+    @classmethod
+    def is_adopted_remote(cls, session: requests.Session, owner: str, repo: str, branch: str) -> bool:
+        """Etapa 1 (via API, sem clonar): o pom.xml da raiz declara o
+        maven-pmd-plugin. Projeto Maven multi-modulo que declara o plugin
+        so nos submodulos nao e detectado (limitacao assumida)."""
+        all_paths = _github_list_all_paths(session, owner, repo, branch)
+        if all_paths is not None and "pom.xml" not in all_paths:
+            return False
+        pom = _github_file_content(session, owner, repo, "pom.xml", branch)
+        return pom is not None and cls.PLUGIN_ARTIFACT_ID in pom
+
+    @classmethod
+    def is_build_supported_remote(cls, session: requests.Session, owner: str, repo: str, branch: str) -> bool:
+        """So Maven (pom.xml na raiz), como no Checkstyle. True quando a API falha."""
+        all_paths = _github_list_all_paths(session, owner, repo, branch)
+        if all_paths is None:
+            return True
+        return "pom.xml" in all_paths
+
+    # ------------------------------------------------------------------
+    # Execucao
+    # ------------------------------------------------------------------
+
+    def run(self, repo_dir: Path, files: list[str]) -> list[dict]:
+        if not files:
+            return []
+
+        plan = self._plan or {}
+        own = plan.get("ruleset") == "own"
+        self.last_run_info = {
+            "own_config_load_failed": False, "linter_version": None,
+            "ruleset_efetivo": "own" if own else "default",
+        }
+
+        if own:
+            for ver in self.versions:
+                violations, ok, info = self._invoke(repo_dir, files, plan["config_path"], ver)
+                if ok:
+                    for v in violations:
+                        v["linter_version"] = ver["label"]
+                    self.last_run_info["linter_version"] = ver["label"]
+                    self.last_run_info.update(info)
+                    return violations
+                logging.warning(
+                    "Ruleset do projeto %s nao rodou com %s -- tentando outra versao (se houver)",
+                    repo_dir, ver["label"],
+                )
+            newest = self.versions[0]
+            logging.warning(
+                "Ruleset do projeto %s falhou em todas as %d versao(oes) -- tentando com o default (%s)",
+                repo_dir, len(self.versions), self.DEFAULT_RULESET,
+            )
+            violations, ok, info = self._invoke(repo_dir, files, self.DEFAULT_RULESET, newest)
+            if not ok:
+                raise RuntimeError(f"PMD nao rodou nem com o ruleset default ({newest['label']}) em {repo_dir}")
+            for v in violations:
+                v["has_own_config"] = False
+                v["own_config_load_failed"] = True
+                v["linter_version"] = newest["label"]
+            self.last_run_info = {
+                "own_config_load_failed": True, "linter_version": newest["label"],
+                "ruleset_efetivo": "default", **info,
+            }
+            return violations
+
+        newest = self.versions[0]
+        violations, ok, info = self._invoke(repo_dir, files, self.DEFAULT_RULESET, newest)
+        if not ok:
+            raise RuntimeError(f"PMD nao rodou com o ruleset default ({newest['label']}) em {repo_dir}")
+        for v in violations:
+            v["linter_version"] = newest["label"]
+        self.last_run_info["linter_version"] = newest["label"]
+        self.last_run_info.update(info)
+        return violations
+
+    def _invoke(self, repo_dir: Path, files: list[str], ruleset: str, ver: dict) -> tuple[list[dict], bool, dict]:
+        """Roda UMA versao do PMD com um ruleset. Devolve (violacoes,
+        sucesso, info). sucesso=False = o PMD nao conseguiu carregar o
+        ruleset / crashou (exit fora de 0,4,5, sem relatorio, relatorio
+        invalido ou com <configerror>) -- ai o caller tenta outra versao.
+        Timeout vira RuntimeError (erro do commit), nao fallback."""
+        with tempfile.TemporaryDirectory(prefix="pmd_") as tmp:
+            tmp_dir = Path(tmp)
+            filelist = tmp_dir / "files.txt"
+            report = tmp_dir / "report.xml"
+            filelist.write_text("\n".join(files) + "\n", encoding="utf-8")
+            flag = "--file-list" if ver["major"] >= 7 else "-filelist"
+            args = [*ver["launcher"], flag, str(filelist), "-R", ruleset, "-f", "xml", "-r", str(report)]
+            try:
+                result = _run_in_group(args, repo_dir, self.TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"PMD excedeu {self.TIMEOUT_SECONDS}s ({ver['label']}) em {repo_dir}")
+
+            if result.returncode not in self.OK_EXIT_CODES or not report.exists() or report.stat().st_size == 0:
+                logging.error(
+                    "PMD falhou em %s (%s, ruleset=%s, returncode=%s)\nstderr: %s",
+                    repo_dir, ver["label"], ruleset, result.returncode, (result.stderr or "")[:800],
+                )
+                return [], False, {}
+            return self._parse_xml(report, repo_dir, ver)
+
+    def _parse_xml(self, report_path: Path, repo_dir: Path, ver: dict) -> tuple[list[dict], bool, dict]:
+        try:
+            root = ET.parse(report_path).getroot()
+        except ET.ParseError as exc:
+            logging.error("Relatorio XML do PMD malformado em %s: %s", report_path, exc)
+            return [], False, {}
+
+        n_proc_errors = 0
+        violations: list[dict] = []
+        repo_resolved = repo_dir.resolve()
+        for node in root:
+            tag = self._local_name(node.tag)
+            if tag == "configerror":
+                # regra que nao inicializou: o ruleset NAO carregou por inteiro
+                logging.error("PMD configerror em %s (%s): %s", repo_dir, ver["label"], node.attrib)
+                return [], False, {}
+            if tag == "error":
+                n_proc_errors += 1
+                continue
+            if tag != "file":
+                continue
+            name = node.get("name") or ""
+            path = Path(name)
+            try:
+                file_path = str((path if path.is_absolute() else repo_dir / path).resolve().relative_to(repo_resolved))
+                file_path = file_path.replace("\\", "/")
+            except ValueError:
+                file_path = name
+            for vio in node:
+                if self._local_name(vio.tag) != "violation":
+                    continue  # suppressedviolation (// NOPMD) nao entra
+                line = vio.get("beginline")
+                col = vio.get("begincolumn")
+                violations.append({
+                    "file_path": file_path,
+                    "line": int(line) if line else None,
+                    "column": int(col) if col else None,
+                    "rule_id": vio.get("rule"),
+                    "message": (vio.text or "").strip(),
+                    "severity": f"priority_{vio.get('priority', '?')}",
+                })
+        return violations, True, {"pmd_erros_de_processamento": n_proc_errors}
+
+
 # Registro de linters suportados. Adicione a classe nova aqui quando
 # implementar o proximo -- o run_linters.py descobre o subcomando sozinho.
 ADAPTERS = {
     PylintAdapter.name: PylintAdapter,
     CheckstyleAdapter.name: CheckstyleAdapter,
     ESLintAdapter.name: ESLintAdapter,
+    PMDAdapter.name: PMDAdapter,
 }
